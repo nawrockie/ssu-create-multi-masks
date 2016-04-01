@@ -233,26 +233,57 @@ my $desc_string = (opt_Get("--skipalign", \%opt_HH)) ?
 $start_secs = outputProgressPrior($desc_string, $progress_w, $log_FH, *STDOUT);
   
 my $njobs_submitted = 0;
-my @sum_file_A = (); # all of the .sum files created by ssu-align
-my @stk_file_A = (); # all of the .stk files created by ssu-align
+my @sum_file_A      = (); # all of the .sum files created by ssu-align
+my @stk_file_A      = (); # all of the .stk files created by ssu-align
+my @ssu_mask_cmd_A  = (); # all of the ssu-mask commands to run in step 3
+my @ssu_mask_file_A = (); # all of the ssu-mask output files that will be created in step 3
+my @out_dir_A       = (); # all of the output directories created by ssu-align 
+
+my @concat_stk_file_A = (); # stk files created by ssu-align for alignments of concatenated fasta files
+my @concat_out_dir_A  = (); # output directories created by ssu-align for alignments of concatenated fasta files
+
+my $pf_option = "--pf " . opt_Get("--pf", \%opt_HH);
+my $pt_option = "--pt " . opt_Get("--pt", \%opt_HH);
+
+my %fafile_H = ();
+$fafile_H{"archaea"}          = $archaea_fafile;
+$fafile_H{"bacteria"}         = $bacteria_fafile;
+$fafile_H{"archaea-bacteria"} = $concat_file;
+
 foreach my $domain ("archaea", "bacteria") { 
-  foreach my $fafile ($archaea_fafile, $bacteria_fafile, $concat_file) { 
+  foreach my $key (sort keys %fafile_H) { 
+    my $fafile = $fafile_H{$key};
     $njobs_submitted++;
     my $fafile_root = removeDirPath($fafile);
     $fafile_root =~ s/\.fa$//;
     my $dir_root = $fafile_root . "-to-" . $domain;
     my $out_dir = $dir . "/" . $dir_root;
+    # the ssu-align command
     my $ssu_align_cmd = $execs_H{"ssu-align"} . " -f -n $domain --no-search $fafile $out_dir";
+
     my $jobname = "ssu-align." . $dir_root; 
     my $errfile = "ssu-align." . $dir_root . ".err";
     my $farm_cmd = "qsub -N $jobname -b y -v SGE_FACILITIES -P unified -S /bin/bash -cwd -V -j n -o /dev/null -e $errfile -m n -l h_rt=288000,h_vmem=8G,mem_free=8G -pe multicore 4 -R y " . "\"" . $ssu_align_cmd . "\" > /dev/null\n";
     my $ssu_align_sum_file = $out_dir . "/" . $dir_root . ".ssu-align.sum";
     my $ssu_align_stk_file = $out_dir . "/" . $dir_root . ".$domain.stk";
     if(! (opt_Get("--skipalign", \%opt_HH))) { 
-      runCommand($farm_cmd, 0, $FH_HR);
+      runCommand($farm_cmd, opt_Get("-v", \%opt_HH), $FH_HR);
     }
+    push(@out_dir_A,  $out_dir);
     push(@sum_file_A, $ssu_align_sum_file);
     push(@stk_file_A, $ssu_align_stk_file);
+
+    # if we're a concatenated alignment, we'll map these guys later
+    if($key eq "archaea-bacteria") { 
+      push(@concat_stk_file_A, $ssu_align_stk_file);
+      push(@concat_out_dir_A,  $out_dir);
+    }
+    else { # else if we're not a concatenated alignment, we'll mask later based on posterior probability
+      my $ssu_mask_cmd  = $execs_H{"ssu-mask"} . " $pf_option $pt_option $out_dir > /dev/null";
+      my $ssu_mask_file = $out_dir . "/" . $dir_root . ".$domain.mask";
+      push(@ssu_mask_cmd_A,  $ssu_mask_cmd);
+      push(@ssu_mask_file_A, $ssu_mask_file);
+    }
   }
 }
 
@@ -269,6 +300,61 @@ else { # --skipalign not used, wait for jobs to finish
   }
 }
 outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
+
+#########################################################################################
+# Step 3. Run ssu-mask on each of the single domain sequence ssu-align created alignments
+#########################################################################################
+# the ssu-mask commands were created in step 2, when it was convenient
+$start_secs = outputProgressPrior("Running ssu-mask on all of the ssu-align created alignments", $progress_w, $log_FH, *STDOUT);
+for(my $mask_ctr = 0; $mask_ctr < scalar(@ssu_mask_cmd_A); $mask_ctr++) { 
+  my $ssu_mask_cmd  = $ssu_mask_cmd_A[$mask_ctr];
+  my $ssu_mask_file = $ssu_mask_file_A[$mask_ctr];
+  runCommand($ssu_mask_cmd, opt_Get("-v", \%opt_HH), $FH_HR);
+  addClosedFileToOutputInfo(\%ofile_info_HH, "ssu-mask.$mask_ctr", $ssu_mask_file, 1, sprintf("ssu-mask mask file %d of %d", $mask_ctr+1, scalar(@ssu_mask_cmd_A)));
+}
+outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
+
+##################################################################
+# Step 4. Run ssu-esl-alimap on the multi-domain alignments
+##################################################################
+# there should be exactly 2 files in @concat_stk_file_A, we want to 
+# map each of them to the other with ssu-esl-alimap:
+$start_secs = outputProgressPrior("Running ssu-esl-alimap on the alignments of the concatenated fasta files", $progress_w, $log_FH, *STDOUT);
+if(scalar(@concat_stk_file_A) != 2) { 
+  DNAORG_FAIL("ERROR, should be 2 elements in concat_stk_file_A, but there are not", 1, $FH_HR);
+}
+if(scalar(@concat_out_dir_A) != 2) { 
+  DNAORG_FAIL("ERROR, should be 2 elements in concat_out_dir_A, but there are not", 1, $FH_HR);
+}
+my $concat_stk_file_1 = $concat_stk_file_A[0];
+my $concat_stk_file_2 = $concat_stk_file_A[1];
+my $concat_out_dir_1  = $concat_out_dir_A[0];
+my $concat_out_dir_2  = $concat_out_dir_A[1];
+
+my $mask_file_1 = $concat_out_dir_1 . ".mask";
+my $mask_file_2 = $concat_out_dir_2 . ".mask";
+
+my $alimap_file_1 = $concat_out_dir_1 . ".ssu-esl-alimap";
+my $alimap_file_2 = $concat_out_dir_2 . ".ssu-esl-alimap";
+
+my $map_cmd_1 = $execs_H{"ssu-esl-alimap"} . " --mask-rf2rf $mask_file_1 $concat_stk_file_1 $concat_stk_file_2 > $alimap_file_1";
+my $map_cmd_2 = $execs_H{"ssu-esl-alimap"} . " --mask-rf2rf $mask_file_2 $concat_stk_file_2 $concat_stk_file_1 > $alimap_file_2";
+
+runCommand($map_cmd_1, opt_Get("-v", \%opt_HH), $FH_HR);
+runCommand($map_cmd_2, opt_Get("-v", \%opt_HH), $FH_HR);
+
+addClosedFileToOutputInfo(\%ofile_info_HH, "mapmask1", $alimap_file_1, 1, sprintf("mask for map of alignment %s to %s", removeDirPath($concat_stk_file_1), removeDirPath($concat_stk_file_2)));
+addClosedFileToOutputInfo(\%ofile_info_HH, "mapmask2", $alimap_file_2, 1, sprintf("mask for map of alignmetn %s to %s", removeDirPath($concat_stk_file_2), removeDirPath($concat_stk_file_1)));
+
+addClosedFileToOutputInfo(\%ofile_info_HH, "map1", $alimap_file_1, 1, sprintf("ssu-esl-alimap output for map of alignment %s to %s", removeDirPath($concat_stk_file_1), removeDirPath($concat_stk_file_2)));
+addClosedFileToOutputInfo(\%ofile_info_HH, "map2", $alimap_file_2, 1, sprintf("ssu-esl-alimap output for map of alignmetn %s to %s", removeDirPath($concat_stk_file_2), removeDirPath($concat_stk_file_1)));
+
+outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
+
+##################################################################
+# Step 5. Run ssu-esl-alimap on the multi-domain alignments
+##################################################################
+
 
 ##########
 # Conclude
