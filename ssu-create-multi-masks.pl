@@ -366,13 +366,83 @@ outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
 #####################################
 $start_secs = outputProgressPrior("Parsing ssu-esl-alimap output", $progress_w, $log_FH, *STDOUT);
 
-my @alimap_archaea_A  = (); # [0..$rfpos..rflen_archaea-1] fraction of nucleotides aligned to $rfpos in archaea-based alignment
-                            # that also exist in mapped position in the bacteria-based alignment
-my @alimap_bacteria_A = (); # [0..$rfpos..rflen_archaea-1] fraction of nucleotides aligned to $rfpos in bacteria-based alignment
-                            # that also exist in mapped position in the archaea-based alignment
+my $rflen_archaea;           # nongap-RF length of archaeal model
+my $rflen_bacteria;          # nongap-RF length of bacterial model
+my @rf_archaea_map_A  = ();  # [0..$rfpos..$rflen_archaea-1] bacterial $rfpos this archaeal $rfpos maps to, -1 if none
+my @rf_bacteria_map_A = ();  # [0..$rfpos..$rflen_bacteria-1] bacterial $rfpos this archaeal $rfpos maps to, -1 if none
+my $rf_archaea_nmap;         # number of nongap-RF positions in archaea  that esl-alimap is able to map to bacteria
+my $rf_bacteria_nmap;        # number of nongap-RF positions in bacteria that esl-alimap is able to map to archaea, should be same as $rf_archaea_nmap
+my @rf_archaea_cov_A  = ();  # [0..$rfpos..$rflen_archaea_nmap-1] fraction of nucleotides aligned to $rfpos in archaea-based alignment
+                             # that also exist in mapped position in the bacteria-based alignment
+my @rf_bacteria_cov_A = ();  # [0..$rfpos..$rflen_bacteria_nmap-1] fraction of nucleotides aligned to $rfpos in bacteria-based alignment
+                             # that also exist in mapped position in the archaea-based alignment
 
-parse_esl_alimap_output($alimap_file_archaea,  \@alimap_archaea_A); 
-parse_esl_alimap_output($alimap_file_bacteria, \@alimap_bacteria_A); 
+$rflen_archaea  = parse_esl_alimap_output($alimap_file_archaea,  \@rf_archaea_map_A,  \@rf_archaea_cov_A,  \$rf_archaea_nmap,  $FH_HR);
+$rflen_bacteria = parse_esl_alimap_output($alimap_file_bacteria, \@rf_bacteria_map_A, \@rf_bacteria_cov_A, \$rf_bacteria_nmap, $FH_HR);
+
+outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
+
+######################################
+# Step 6. Create coverage based masks
+######################################
+$start_secs = outputProgressPrior("Creating coverage based masks", $progress_w, $log_FH, *STDOUT);
+
+if($rf_archaea_nmap != $rf_bacteria_nmap) { 
+  DNAORG_FAIL(sprintf("ERROR, number of mapped positions differs between archaeal and bacteria maps, this shouldn't happen; archaea: %d != bacteria: %d", $rf_archaea_nmap, $rf_bacteria_nmap), 1, $FH_HR);
+}
+
+# create the new coverage-based mask for archaea, 
+# rfpos $rfpos is a '1' (included by the mask) iff:
+# - it maps to a position ($rfpos_bacteria) in bacteria
+# - the coverage of $rfpos_archaea  in the archaeal  alignment >= $cov_thresh
+# - the coverage of $rfpos_bacteria in the bacterial alignment >= $cov_thresh
+my $rfpos_archaea;
+my $rfpos_bacteria;
+my $cov_thresh = 0.90;
+my @rf_archaea_cov_mask_A = ();  # [1..$rfpos_archaea $rflen_archaea]: '1' if position $rfpos_archaea
+                                 # is included by coverage based mask, else '0'
+my @rf_bacteria_cov_mask_A = (); # [1..$rfpos_bacteria $rflen_bacteria]: '1' if position $rfpos_bacteria
+                                 # is included by coverage based mask, else '0'
+
+# get the mask in archaeal coordinates, first
+for($rfpos_archaea = 1; $rfpos_archaea <= $rflen_archaea; $rfpos_archaea++) { 
+  $rfpos_bacteria = $rf_archaea_map_A[$rfpos_archaea];
+  printf("rfpos_archaea: $rfpos_archaea, rfpos_bacteria: $rfpos_bacteria\n");
+  if($rfpos_bacteria != -1) { 
+    $rf_archaea_cov_mask_A[$rfpos_archaea] = (($rf_archaea_cov_A[$rfpos_archaea]   >= $cov_thresh) && 
+                                              ($rf_bacteria_cov_A[$rfpos_bacteria] >= $cov_thresh)) ? 1 : 0;
+  }
+  else { 
+    $rf_archaea_cov_mask_A[$rfpos_archaea] = 0; # this position in archaea wasn't mappable to a position in bacteria
+  }
+}
+
+# get the mask in bacterial coordinates, second
+for($rfpos_bacteria = 1; $rfpos_bacteria <= $rflen_bacteria; $rfpos_bacteria++) { 
+  $rfpos_archaea = $rf_bacteria_map_A[$rfpos_bacteria];
+  if($rfpos_archaea != -1) { 
+    $rf_bacteria_cov_mask_A[$rfpos_bacteria] = (($rf_bacteria_cov_A[$rfpos_bacteria]   >= $cov_thresh) && 
+                                              ($rf_archaea_cov_A[$rfpos_archaea] >= $cov_thresh)) ? 1 : 0;
+  }
+  else { 
+    $rf_bacteria_cov_mask_A[$rfpos_bacteria] = 0; # this position in bacteria wasn't mappable to a position in archaea
+  }
+}
+
+# output the masks
+my $rf_archaea_cov_mask_file = create_out_root($fafile_H{"archaea-bacteria"}, "archaea") . ".mask";
+my $rf_archaea_cov_ninc = output_mask_file($rf_archaea_cov_mask_file, \@rf_archaea_cov_mask_A, $rflen_archaea, $FH_HR);
+addClosedFileToOutputInfo(\%ofile_info_HH, "archaea_cov_mask", $rf_archaea_cov_mask_file, 1, sprintf("archaeal mask (%d len, %d included) based on coverage of map between archaeal- and bacterial-based alignments of all sequences", $rf_archaea_cov_ninc, $rflen_archaea));
+
+my $rf_bacteria_cov_mask_file = create_out_root($fafile_H{"archaea-bacteria"}, "bacteria") . ".mask";
+my $rf_bacteria_cov_ninc = output_mask_file($rf_bacteria_cov_mask_file, \@rf_bacteria_cov_mask_A, $rflen_bacteria, $FH_HR);
+addClosedFileToOutputInfo(\%ofile_info_HH, "bacteria_cov_mask", $rf_bacteria_cov_mask_file, 1, sprintf("bacterial mask (%d len, %d included) based on coverage of map between archaeal- and bacterial-based alignments of all sequences", $rf_bacteria_cov_ninc, $rflen_bacteria));
+
+if($rf_archaea_cov_ninc != $rf_bacteria_cov_ninc) { 
+  DNAORG_FAIL(sprintf("ERROR, number of positions included for archaea in coverage based mask %d, differs from number of positions included for bacteria: %d", $rf_archaea_cov_ninc, $rf_bacteria_cov_ninc), 1, $FH_HR);
+}
+
+outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
 
 ##########
 # Conclude
@@ -485,31 +555,45 @@ sub create_out_root {
   return $dir_root;
 }
 
-
 #################################################################
 # Subroutine : parse_esl_alimap_output()
 # Incept:      EPN, Mon Apr  4 10:31:20 2016
 #
-# Purpose: Given esl-alimap output, create an array of the coverage
-#          values for all positions which map one nongap RF position
-#          to another. 
+# Purpose: Given esl-alimap output, parse it. 
+#          Fill @{$rf_map_A}, $$rf_nmap, and 
+#          @{$rf_cov_A}.
 #
 # Arguments: 
 #  $infile:      the esl-alimap output
-#  $AR:          reference to the array to fill
+#  $rf_map_AR:   reference to the 'map' array to fill
+#                [1..$rfpos1..$rflen]: $rfpos2, $rfpos2 is 
+#                the nongap RF position in alignment 2 that 
+#                $rfpos1 maps to, -1 if none.
+#                $rf_map_AR[0] is always -1.
+#  $rf_cov_AR:   reference to the 'coverage' array to fill
+#                [1..$rfpos1..$rflen]: $x, $x is the fraction
+#                of nucleotides in $rfpos1 in alignment 1 that
+#                are also in $rf_map_AR[$rfpos1]=$rfpos2 position
+#                in alignment 2. -1 if $rf_map_AR[$rfpos1] == -1.
+#                $rf_cov_AR[0] is always -1.
+#  $rf_nmap_R:   reference to the scalar to fill with 
+#                the number of nongap-RF positions in alignment
+#                2 that nongap-RF positions in alignment 1 
+#                map to, this is the number of non '-1' values
+#                in @{$rf_map_AR}.
 #  $FH_HR:       ref to hash of open file handles
 # 
-# Returns:     Void, fills @{$AR}.
+# Returns:     The non-gap RF length of alignment 1 in the output.
 # 
 # Dies: if we can't open $infile.
 #
 ################################################################# 
 sub parse_esl_alimap_output {
   my $sub_name = "parse_esl_alimap_output()";
-  my $nargs_expected = 2;
+  my $nargs_expected = 5;
   if(scalar(@_) != $nargs_expected) { printf STDERR ("ERROR, $sub_name entered with %d != %d input arguments.\n", scalar(@_), $nargs_expected); exit(1); } 
 
-  my ($infile, $AR) = @_;
+  my ($infile, $rf_map_AR, $rf_cov_AR, $rf_nmap_R, $FH_HR) = @_;
 
   open(IN, $infile) || fileOpenFailure($infile, $sub_name, $!, "reading", $FH_HR);
 
@@ -529,20 +613,101 @@ sub parse_esl_alimap_output {
   #   1577   1830  -->   1507   2086    113 /   113 (1.0000)
   ##    $1     $2          $3     $4     $5      $6  $7
 
+  # initialize
+  $rf_map_AR->[0] = -1;
+  $rf_cov_AR->[0] = -1;
+  my $rf_nmap = 0;
+  my $rflen   = 0;
+
   my $line;
   while($line = <IN>) { 
     if($line !~ m/^\#/) { 
       $line =~ s/^\s+//; # remove leading whitespace
       if($line =~ /(\S+)\s+(\S+)\s+\-\-\>\s+(\S+)\s+(\S+)\s+(\d+)\s+\/\s+(\d+)\s+\((\S+)\)/) { 
         my ($rfpos1, $rfpos2, $ncommon, $ntotal, $fcov) = ($1, $3, $5, $6, $7);
-        if(verify_integer($rfpos1) && verify_integer($rfpos2)) { 
-          push(@{$AR}, $fcov);
-          printf("AR->[%d]: $fcov\n", scalar(@{$AR})-1);
+        if(verify_integer($rfpos1)) { 
+          # this is a nongap rf position in alignment 1
+          if($rfpos1 > $rflen) { 
+            $rflen = $rfpos1;
+          }
+          if(verify_integer($rfpos2)) { 
+            # this is a nongap rf position in alignment 2
+            $rf_map_AR->[$rfpos1] = $rfpos2;
+            $rf_cov_AR->[$rfpos1] = $fcov;
+            $rf_nmap++;
+          }
+          else { 
+            $rf_map_AR->[$rfpos1] = -1;
+            $rf_cov_AR->[$rfpos1] = -1;
+          }
+          printf("in $sub_name, rfpos: $rfpos1, map: %d, cov: %.2f\n", $rf_map_AR->[$rfpos1], $rf_cov_AR->[$rfpos1]);
         }
       }
     }
   }
 
-  return;
+  # now that we have $rflen, go back and fill in all undefined values in @{$rf_map_AR} and @{$rf_cov_AR}
+  for(my $rfpos1 = 1; $rfpos1 <= $rflen; $rfpos1++) { 
+    if(! defined $rf_map_AR->[$rfpos1]) { 
+      $rf_map_AR->[$rfpos1] = -1;
+    }
+    if(! defined $rf_cov_AR->[$rfpos1]) { 
+      $rf_cov_AR->[$rfpos1] = -1;
+    }
+  }
+
+  $$rf_nmap_R = $rf_nmap;
+
+  return $rflen;
 }
 
+#################################################################
+# Subroutine : output_mask_file()
+# Incept:      EPN, Mon Apr  4 15:10:15 2016
+#
+# Purpose: Output a mask file, given an array @{$AR} with '0'
+#          and '1' values from [1..$len], write a mask file
+#          with a single line of length $len with '0's and '1's.
+#
+# Arguments: 
+#  $outfile: name of output file to create
+#  $AR:      ref to array of '0's and '1's, only use elements [1..$len]
+#  $len:     number of elements in @{$AR} (scalar(@{$AR} == $len+1)
+#  $FH_HR:   ref to hash of open file handles
+#
+# Returns:   Number of '1's printed to $outfile (number of 
+#            positions included by the mask).
+# 
+# Dies: If we can't open $outfile for writing.
+#       If scalar(@{$AR} != ($len+1)).
+#       If any value in @{$AR} is not '0' or '1' within 1..$len
+################################################################# 
+sub output_mask_file { 
+  my $sub_name = "output_mask_file()";
+  my $nargs_expected = 4;
+  if(scalar(@_) != $nargs_expected) { printf STDERR ("ERROR, $sub_name entered with %d != %d input arguments.\n", scalar(@_), $nargs_expected); exit(1); } 
+
+  my ($outfile, $AR, $len, $FH_HR) = @_;
+
+  if(scalar(@{$AR}) != ($len+1)) { 
+    DNAORG_FAIL("ERROR in $sub_name, array length not equal to 1 plus $len", 1, $FH_HR);
+  }
+  for(my $pos = 1; $pos <= $len; $pos++) { 
+    if(($AR->[$pos] ne "0") && ($AR->[$pos] ne "1")) { 
+      DNAORG_FAIL(sprintf("ERROR in $sub_name, position $pos in passed in array has a value that is not a '0' and not a '1': %s", $AR->[$pos]), 1, $FH_HR);
+    }
+  }
+      
+  my $ninc = 0;
+  open(OUT, ">", $outfile) || fileOpenFailure($outfile, $sub_name, $!, "writing", $FH_HR);
+  for(my $pos = 1; $pos <= $len; $pos++) { 
+    if($AR->[$pos] eq "1") { 
+      $ninc++;
+    }
+    print OUT $AR->[$pos];
+  }
+  print OUT "\n";
+  close(OUT);
+
+  return $ninc;
+}
