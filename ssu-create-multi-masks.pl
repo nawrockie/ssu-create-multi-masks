@@ -252,40 +252,39 @@ $fafile_H{"archaea-bacteria"} = $concat_file;
 
 foreach my $domain ("archaea", "bacteria") { 
   foreach my $key (sort keys %fafile_H) { 
-    my $fafile = $fafile_H{$key};
-    $njobs_submitted++;
-    my $fafile_root = removeDirPath($fafile);
-    $fafile_root =~ s/\.fa$//;
-    my $dir_root = $fafile_root . "-to-" . $domain;
-    my $out_dir = $dir . "/" . $dir_root;
-    # the ssu-align command
-    my $ssu_align_cmd = $execs_H{"ssu-align"} . " -f -n $domain --no-search $fafile $out_dir";
+    my $fafile   = $fafile_H{$key};
+    my $out_root = create_out_root($fafile, $domain);
+    my $out_dir  = $dir . "/" . $out_root;
 
-    my $jobname = "ssu-align." . $dir_root; 
-    my $errfile = "ssu-align." . $dir_root . ".err";
+    # the ssu-align command
+    my $ssu_align_cmd = $execs_H{"ssu-align"} . " -f -n $domain --no-search $fafile $out_root";
+
+    my $jobname = "ssu-align." . $out_root; 
+    my $errfile = "ssu-align." . $out_root . ".err";
     my $farm_cmd = "qsub -N $jobname -b y -v SGE_FACILITIES -P unified -S /bin/bash -cwd -V -j n -o /dev/null -e $errfile -m n -l h_rt=288000,h_vmem=8G,mem_free=8G -pe multicore 4 -R y " . "\"" . $ssu_align_cmd . "\" > /dev/null\n";
-    my $ssu_align_sum_file = $out_dir . "/" . $dir_root . ".ssu-align.sum";
-    my $ssu_align_stk_file = $out_dir . "/" . $dir_root . ".$domain.stk";
+    $njobs_submitted++;
+
+    my $ssu_align_sum_file = $out_dir . "/" . $out_root . ".ssu-align.sum";
+    my $ssu_align_stk_file = $out_dir . "/" . $out_root . ".$domain.stk";
     if(! (opt_Get("--skipalign", \%opt_HH))) { 
       runCommand($farm_cmd, opt_Get("-v", \%opt_HH), $FH_HR);
     }
     push(@out_dir_A,  $out_dir);
     push(@sum_file_A, $ssu_align_sum_file);
     push(@stk_file_A, $ssu_align_stk_file);
-
-    # if we're a concatenated alignment, we'll map these guys later
-    if($key eq "archaea-bacteria") { 
-      push(@concat_stk_file_A, $ssu_align_stk_file);
-      push(@concat_out_dir_A,  $out_dir);
-    }
-    else { # else if we're not a concatenated alignment, we'll mask later based on posterior probability
-      my $ssu_mask_cmd  = $execs_H{"ssu-mask"} . " $pf_option $pt_option $out_dir > /dev/null";
-      my $ssu_mask_file = $out_dir . "/" . $dir_root . ".$domain.mask";
-      push(@ssu_mask_cmd_A,  $ssu_mask_cmd);
-      push(@ssu_mask_file_A, $ssu_mask_file);
-    }
   }
 }
+
+#    # if we're a concatenated alignment, we'll map these guys later
+#    if($key eq "archaea-bacteria") { 
+#      push(@concat_stk_file_A, $ssu_align_stk_file);
+#      push(@concat_out_dir_A,  $out_dir);
+#    }
+#    else { # else if we're not a concatenated alignment, we'll mask later based on posterior probability
+#      my $ssu_mask_cmd  = $execs_H{"ssu-mask"} . " $pf_option $pt_option $out_dir > /dev/null";
+#      my $ssu_mask_file = $out_dir . "/" . $dir_root . ".$domain.mask";
+#      push(@ssu_mask_cmd_A,  $ssu_mask_cmd);
+#      push(@ssu_mask_file_A, $ssu_mask_file);
 
 if(opt_Get("--skipalign", \%opt_HH)) { 
   # validate all alignments exist
@@ -306,55 +305,74 @@ outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
 #########################################################################################
 # the ssu-mask commands were created in step 2, when it was convenient
 $start_secs = outputProgressPrior("Running ssu-mask on all of the ssu-align created alignments", $progress_w, $log_FH, *STDOUT);
-for(my $mask_ctr = 0; $mask_ctr < scalar(@ssu_mask_cmd_A); $mask_ctr++) { 
-  my $ssu_mask_cmd  = $ssu_mask_cmd_A[$mask_ctr];
-  my $ssu_mask_file = $ssu_mask_file_A[$mask_ctr];
-  runCommand($ssu_mask_cmd, opt_Get("-v", \%opt_HH), $FH_HR);
-  addClosedFileToOutputInfo(\%ofile_info_HH, "ssu-mask.$mask_ctr", $ssu_mask_file, 1, sprintf("ssu-mask mask file %d of %d", $mask_ctr+1, scalar(@ssu_mask_cmd_A)));
+foreach my $domain ("archaea", "bacteria") { 
+  foreach my $key (sort keys %fafile_H) { 
+    my $fafile = $fafile_H{$key};
+    my $out_root = create_out_root($fafile, $domain);
+    my $out_dir  = $dir . "/" . $out_root;
+    
+    if($key ne "archaea-bacteria") { 
+      # mask this alignment
+      my $ssu_mask_cmd  = $execs_H{"ssu-mask"} . " $pf_option $pt_option $out_dir > /dev/null";
+      my $ssu_mask_file = $out_dir . "/" . $out_root . ".$domain.mask";
+      runCommand($ssu_mask_cmd, opt_Get("-v", \%opt_HH), $FH_HR);
+      addClosedFileToOutputInfo(\%ofile_info_HH, "ssu-mask.$domain.$key", $ssu_mask_file, 1, sprintf("ssu-mask mask file for %s-based alignment of %s sequences", $domain, $key));
+    }
+  }
 }
 outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
 
 ##################################################################
 # Step 4. Run ssu-esl-alimap on the multi-domain alignments
 ##################################################################
-# there should be exactly 2 files in @concat_stk_file_A, we want to 
-# map each of them to the other with ssu-esl-alimap:
+# map the two alignments of the combined archaea+bacteria to each other
 $start_secs = outputProgressPrior("Running ssu-esl-alimap on the alignments of the concatenated fasta files", $progress_w, $log_FH, *STDOUT);
-if(scalar(@concat_stk_file_A) != 2) { 
-  DNAORG_FAIL("ERROR, should be 2 elements in concat_stk_file_A, but there are not", 1, $FH_HR);
-}
-if(scalar(@concat_out_dir_A) != 2) { 
-  DNAORG_FAIL("ERROR, should be 2 elements in concat_out_dir_A, but there are not", 1, $FH_HR);
-}
-my $concat_stk_file_1 = $concat_stk_file_A[0];
-my $concat_stk_file_2 = $concat_stk_file_A[1];
-my $concat_out_dir_1  = $concat_out_dir_A[0];
-my $concat_out_dir_2  = $concat_out_dir_A[1];
 
-my $mask_file_1 = $concat_out_dir_1 . ".mask";
-my $mask_file_2 = $concat_out_dir_2 . ".mask";
+my $key = "archaea-bacteria";
+my $domain = "archaea";
+my $fafile = $fafile_H{$key};
 
-my $alimap_file_1 = $concat_out_dir_1 . ".ssu-esl-alimap";
-my $alimap_file_2 = $concat_out_dir_2 . ".ssu-esl-alimap";
+my $out_root_archaea  = create_out_root($fafile, "archaea");
+my $out_root_bacteria = create_out_root($fafile, "bacteria");
 
-my $map_cmd_1 = $execs_H{"ssu-esl-alimap"} . " --mask-rf2rf $mask_file_1 $concat_stk_file_1 $concat_stk_file_2 > $alimap_file_1";
-my $map_cmd_2 = $execs_H{"ssu-esl-alimap"} . " --mask-rf2rf $mask_file_2 $concat_stk_file_2 $concat_stk_file_1 > $alimap_file_2";
+my $out_dir_archaea   = $dir . "/" . $out_root_archaea;
+my $out_dir_bacteria  = $dir . "/" . $out_root_bacteria;
 
-runCommand($map_cmd_1, opt_Get("-v", \%opt_HH), $FH_HR);
-runCommand($map_cmd_2, opt_Get("-v", \%opt_HH), $FH_HR);
+my $ssu_align_stk_file_archaea  = $out_dir_archaea  . "/" . $out_root_archaea  . ".archaea.stk";
+my $ssu_align_stk_file_bacteria = $out_dir_bacteria . "/" . $out_root_bacteria . ".bacteria.stk";
 
-addClosedFileToOutputInfo(\%ofile_info_HH, "mapmask1", $alimap_file_1, 1, sprintf("mask for map of alignment %s to %s", removeDirPath($concat_stk_file_1), removeDirPath($concat_stk_file_2)));
-addClosedFileToOutputInfo(\%ofile_info_HH, "mapmask2", $alimap_file_2, 1, sprintf("mask for map of alignmetn %s to %s", removeDirPath($concat_stk_file_2), removeDirPath($concat_stk_file_1)));
+my $mask_file_archaea  = $out_dir_archaea  . ".mask";
+my $mask_file_bacteria = $out_dir_bacteria . ".mask";
 
-addClosedFileToOutputInfo(\%ofile_info_HH, "map1", $alimap_file_1, 1, sprintf("ssu-esl-alimap output for map of alignment %s to %s", removeDirPath($concat_stk_file_1), removeDirPath($concat_stk_file_2)));
-addClosedFileToOutputInfo(\%ofile_info_HH, "map2", $alimap_file_2, 1, sprintf("ssu-esl-alimap output for map of alignmetn %s to %s", removeDirPath($concat_stk_file_2), removeDirPath($concat_stk_file_1)));
+my $alimap_file_archaea  = $out_dir_archaea  . ".ssu-esl-alimap";
+my $alimap_file_bacteria = $out_dir_bacteria . ".ssu-esl-alimap";
+
+my $map_cmd_archaea  = $execs_H{"ssu-esl-alimap"} . " --mask-rf2rf $mask_file_archaea  $ssu_align_stk_file_archaea  $ssu_align_stk_file_bacteria > $alimap_file_archaea";
+my $map_cmd_bacteria = $execs_H{"ssu-esl-alimap"} . " --mask-rf2rf $mask_file_bacteria $ssu_align_stk_file_bacteria $ssu_align_stk_file_archaea  > $alimap_file_bacteria";
+
+runCommand($map_cmd_archaea,  opt_Get("-v", \%opt_HH), $FH_HR);
+runCommand($map_cmd_bacteria, opt_Get("-v", \%opt_HH), $FH_HR);
+
+addClosedFileToOutputInfo(\%ofile_info_HH, "mapmask_archaea", $mask_file_archaea,   1, sprintf("mask for map of alignment %s to %s", removeDirPath($ssu_align_stk_file_archaea), removeDirPath($ssu_align_stk_file_bacteria)));
+addClosedFileToOutputInfo(\%ofile_info_HH, "mapmask_bacteria", $mask_file_bacteria, 1, sprintf("mask for map of alignment %s to %s", removeDirPath($ssu_align_stk_file_bacteria), removeDirPath($ssu_align_stk_file_archaea)));
+
+addClosedFileToOutputInfo(\%ofile_info_HH, "map_archaea", $alimap_file_archaea,   1, sprintf("ssu-esl-alimap output for map of alignment %s to %s", removeDirPath($ssu_align_stk_file_archaea), removeDirPath($ssu_align_stk_file_bacteria)));
+addClosedFileToOutputInfo(\%ofile_info_HH, "map_bacteria", $alimap_file_bacteria, 1, sprintf("ssu-esl-alimap output for map of alignment %s to %s", removeDirPath($ssu_align_stk_file_bacteria), removeDirPath($ssu_align_stk_file_archaea)));
 
 outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
 
-##################################################################
-# Step 5. Run ssu-esl-alimap on the multi-domain alignments
-##################################################################
+#####################################
+# Step 5. Parse the esl-alimap output 
+#####################################
+$start_secs = outputProgressPrior("Parsing ssu-esl-alimap output", $progress_w, $log_FH, *STDOUT);
 
+my @alimap_archaea_A  = (); # [0..$rfpos..rflen_archaea-1] fraction of nucleotides aligned to $rfpos in archaea-based alignment
+                            # that also exist in mapped position in the bacteria-based alignment
+my @alimap_bacteria_A = (); # [0..$rfpos..rflen_archaea-1] fraction of nucleotides aligned to $rfpos in bacteria-based alignment
+                            # that also exist in mapped position in the archaea-based alignment
+
+parse_esl_alimap_output($alimap_file_archaea,  \@alimap_archaea_A); 
+parse_esl_alimap_output($alimap_file_bacteria, \@alimap_bacteria_A); 
 
 ##########
 # Conclude
@@ -433,3 +451,98 @@ sub wait_for_farm_jobs_to_finish {
   
   return $nfinished;
 }
+
+#################################################################
+# Subroutine : create_out_root()
+# Incept:      EPN, Mon Apr  4 09:51:41 2016
+#
+# Purpose: Given a fasta file name, domain, and output directory
+#          name, create the 'output root', a string that output
+#          files related to this combination of $domain and 
+#          $fafile will be named.
+#
+# Arguments: 
+#  $fafile:      fasta file name
+#  $domain:      domain, e.g. "archaea"
+# 
+# Returns:     $out_root, a string for output file names.
+# 
+# Dies: never.
+#
+################################################################# 
+sub create_out_root { 
+  my $sub_name = "create_out_root()";
+  my $nargs_expected = 2;
+  if(scalar(@_) != $nargs_expected) { printf STDERR ("ERROR, $sub_name entered with %d != %d input arguments.\n", scalar(@_), $nargs_expected); exit(1); } 
+
+  my ($fafile, $domain) = @_;
+
+  my $fafile_root = removeDirPath($fafile);
+  $fafile_root =~ s/\.fa$//;
+
+  my $dir_root = $fafile_root . "-to-" . $domain;
+
+  return $dir_root;
+}
+
+
+#################################################################
+# Subroutine : parse_esl_alimap_output()
+# Incept:      EPN, Mon Apr  4 10:31:20 2016
+#
+# Purpose: Given esl-alimap output, create an array of the coverage
+#          values for all positions which map one nongap RF position
+#          to another. 
+#
+# Arguments: 
+#  $infile:      the esl-alimap output
+#  $AR:          reference to the array to fill
+#  $FH_HR:       ref to hash of open file handles
+# 
+# Returns:     Void, fills @{$AR}.
+# 
+# Dies: if we can't open $infile.
+#
+################################################################# 
+sub parse_esl_alimap_output {
+  my $sub_name = "parse_esl_alimap_output()";
+  my $nargs_expected = 2;
+  if(scalar(@_) != $nargs_expected) { printf STDERR ("ERROR, $sub_name entered with %d != %d input arguments.\n", scalar(@_), $nargs_expected); exit(1); } 
+
+  my ($infile, $AR) = @_;
+
+  open(IN, $infile) || fileOpenFailure($infile, $sub_name, $!, "reading", $FH_HR);
+
+  # example of output:
+  ## test/archaea-0p1-bacteria-0p1-to-bacteria/archaea-0p1-bacteria-0p1-to-bacteria.bacteria.stk alignment length:              1836
+  ## test/archaea-0p1-bacteria-0p1-to-archaea/archaea-0p1-bacteria-0p1-to-archaea.archaea.stk alignment length:              2092
+  ##     msa 1              msa 2                           
+  ## ------------       ------------                        
+  ## rfpos   apos       rfpos   apos     num common residues
+  ## -----  -----       -----  -----   ---------------------
+  #      -   1836  -->      -   2092      3 /     4 (0.7500)
+  #   1582   1835  -->      -   2091     39 /    39 (1.0000)
+  #   1581   1834  -->      -   2090     46 /    46 (1.0000)
+  #   1580   1833  -->      -   2089     74 /    74 (1.0000)
+  #   1579   1832  -->      -   2088     89 /    89 (1.0000)
+  #   1578   1831  -->   1508   2087    108 /   108 (1.0000)
+  #   1577   1830  -->   1507   2086    113 /   113 (1.0000)
+  ##    $1     $2          $3     $4     $5      $6  $7
+
+  my $line;
+  while($line = <IN>) { 
+    if($line !~ m/^\#/) { 
+      $line =~ s/^\s+//; # remove leading whitespace
+      if($line =~ /(\S+)\s+(\S+)\s+\-\-\>\s+(\S+)\s+(\S+)\s+(\d+)\s+\/\s+(\d+)\s+\((\S+)\)/) { 
+        my ($rfpos1, $rfpos2, $ncommon, $ntotal, $fcov) = ($1, $3, $5, $6, $7);
+        if(verify_integer($rfpos1) && verify_integer($rfpos2)) { 
+          push(@{$AR}, $fcov);
+          printf("AR->[%d]: $fcov\n", scalar(@{$AR})-1);
+        }
+      }
+    }
+  }
+
+  return;
+}
+
