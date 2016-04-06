@@ -53,7 +53,7 @@ opt_Add("--bacmask",     "string",  undef,                    2,    undef, undef
 $opt_group_desc_H{"3"} = "options affecting coverage based masking steps";
 opt_Add("--cthresh",     "real",    "0.90",                   3,    undef, undef,      "set coverage threshold as <x>",                              "set coverage threshold as <x>", \%opt_HH, \@opt_order_A);
 $opt_group_desc_H{"4"} = "options for turning on and modifying posterior probability based masking steps";
-opt_Add("--pp",          "boolean", 0,                        4,    undef, undef,       "create posterior probability based masks too",               "create posterior probability based masks too", \%opt_HH, \@opt_order_A);
+opt_Add("--pp",          "boolean", 0,                        4,    undef, undef,       "merge coverage mask with posterior-probability based masks", "merge coverage mask with posterior-probability based masks instead of with default masks", \%opt_HH, \@opt_order_A);
 opt_Add("--pthresh",     "real",    "0.90",                   4,   "--pp", undef,       "set probability threshold as <x>",                           "set probability threshold as <x>", \%opt_HH, \@opt_order_A);
 opt_Add("--pfract",      "real",    "0.90",                   4,   "--pp", undef,       "include columns w/<x> fraction of seqs w/prob >= --pthresh <y>",  "include columns w/<x> fraction of seqs w/prob >= --pthresh <y>", \%opt_HH, \@opt_order_A);
 $opt_group_desc_H{"5"} = "options for skipping stages and using files created in earlier runs";
@@ -118,6 +118,9 @@ my $bacteria_fafile      = opt_Get("--bacfasta", \%opt_HH);        # this will b
 my $archaea_df_maskfile  = opt_Get("--arcmask", \%opt_HH);         # this will be undefined unless --arcmask set on cmdline
 my $bacteria_df_maskfile = opt_Get("--bacmask", \%opt_HH);         # this will be undefined unless --bacmask set on cmdline
 
+my %cov_df_merged_mask_H = (); # key: domain (e.g. "archaea"), value mask file with merged cov+df mask
+my %cov_pp_merged_mask_H = (); # key: domain (e.g. "archaea"), value mask file with merged cov+pp mask
+
 # we require --archaea and --bacteria currently
 if(! defined $archaea_fafile) { 
   die "ERROR --arcfasta not used, it has to be (currently)"; 
@@ -125,11 +128,14 @@ if(! defined $archaea_fafile) {
 if(! defined $bacteria_fafile) { 
   die "ERROR --bacfasta not used, it has to be (currently)"; 
 }
-if(! defined $archaea_df_maskfile) { 
-  die "ERROR --arcmask not used, it has to be (currently)"; 
-}
-if(! defined $bacteria_df_maskfile) { 
-  die "ERROR --bacmask not used, it has to be (currently)"; 
+# we also require --arcmask and --bacmask unless --pp was used
+if(! opt_Get("--pp", \%opt_HH)) { 
+  if(! defined $archaea_df_maskfile) { 
+    die "ERROR --arcmask not used, it has to be (currently)"; 
+  }
+  if(! defined $bacteria_df_maskfile) { 
+    die "ERROR --bacmask not used, it has to be (currently)"; 
+  }
 }
 
 #############################
@@ -212,6 +218,7 @@ my %execs_H = (); # hash with paths to all required executables
 $execs_H{"ssu-align"}       = $exec_dir . "ssu-align";
 $execs_H{"ssu-esl-alimap"}  = $exec_dir . "ssu-esl-alimap";
 $execs_H{"ssu-mask"}        = $exec_dir . "ssu-mask";
+$execs_H{"ssu-draw"}        = $exec_dir . "ssu-draw";
 validateExecutableHash(\%execs_H, $ofile_info_HH{"FH"});
 
 ############################################################################
@@ -315,34 +322,6 @@ else { # --skipalign not used, wait for jobs to finish
 }
 outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
 
-#########################################################################################
-# Step 3. Run ssu-mask on each of the single domain sequence ssu-align created alignments
-#########################################################################################
-$start_secs = outputProgressPrior("Running ssu-mask on all of the ssu-align created alignments", $progress_w, $log_FH, *STDOUT);
-my %pp_mask_file_HH = (); # 2D hash, 1st dim key: model, 2nd dim key: sequences aligned 
-my $pf_option = "--pf " . opt_Get("--pfract", \%opt_HH);
-my $pt_option = "--pt " . opt_Get("--pthresh", \%opt_HH);
-my $pf_key    = "pf." . int(100 * opt_Get("--pfract", \%opt_HH));
-my $pt_key    = "pt." . int(100 * opt_Get("--pthresh", \%opt_HH));
-
-foreach my $domain ("archaea", "bacteria") { 
-  foreach my $key (sort keys %fafile_H) { 
-    my $fafile = $fafile_H{$key};
-    my $out_root = create_out_root($fafile, $domain);
-    my $out_dir  = $dir . "/" . $out_root;
-    
-    if($key ne "archaea-bacteria") { 
-      # mask this alignment
-      my $ssu_mask_cmd  = $execs_H{"ssu-mask"} . " $pf_option $pt_option $out_dir > /dev/null";
-      my $ssu_mask_file = $out_dir . "/" . $out_root . ".$domain.mask";
-      $pp_mask_file_HH{$domain}{$key} = $ssu_mask_file;
-      runCommand($ssu_mask_cmd, opt_Get("-v", \%opt_HH), $FH_HR);
-      # addClosedFileToOutputInfo(\%ofile_info_HH, "ssu-mask.$domain.$key", $ssu_mask_file, 1, sprintf("ssu-mask mask file for %s-based alignment of %s sequences", $domain, $key));
-    }
-  }
-}
-outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
-
 ##################################################################
 # Step 4. Run ssu-esl-alimap on the multi-domain alignments
 ##################################################################
@@ -388,9 +367,9 @@ addClosedFileToOutputInfo(\%ofile_info_HH, "mapmask_bacteria", $mask_file_bacter
 
 outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
 
-#####################################
+######################################
 # Step 5. Parse the esl-alimap output 
-#####################################
+######################################
 $start_secs = outputProgressPrior("Parsing ssu-esl-alimap output", $progress_w, $log_FH, *STDOUT);
 
 my $rflen_archaea;           # nongap-RF length of archaeal model
@@ -472,81 +451,119 @@ if($rf_archaea_cov_ninc != $rf_bacteria_cov_ninc) {
 
 outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
 
-#############################################################################
-# Step 7. Merge coverage-based and default 0.1 SSU-ALIGN masks into new masks
-#############################################################################
-$start_secs = outputProgressPrior("Merging coverage and SSU-ALIGN-0.1 based masks", $progress_w, $log_FH, *STDOUT);
+#######################################################################
+# Step 7 is performed by default, but is skipped if --pp used.
+# If --pp is ued, steps 9-11 are performed instead.
+#######################################################################
+if(! opt_Get("--pp", \%opt_HH)) { 
+  #################################################################################################
+  # Step 7. Merge coverage-based and default 0.1 SSU-ALIGN masks into new masks (UNLESS --pp USED) 
+  #################################################################################################
+  $start_secs = outputProgressPrior("Merging coverage and SSU-ALIGN-0.1 based masks", $progress_w, $log_FH, *STDOUT);
+  
+  my @rf_archaea_df_mask_A   = ();           # the archaeal default mask
+  my @rf_bacteria_df_mask_A  = ();           # the bacterial default mask
+  my @rf_archaea_cov_df_merged_mask_A  = (); # the merged archaeal coverage and default mask
+  my @rf_bacteria_cov_df_merged_mask_A = (); # the merged bacterial coverage and default mask
 
-my @rf_archaea_df_mask_A   = ();           # the archaeal default mask
-my @rf_bacteria_df_mask_A  = ();           # the bacterial default mask
-my @rf_archaea_cov_df_merged_mask_A  = (); # the merged archaeal coverage and default mask
-my @rf_bacteria_cov_df_merged_mask_A = (); # the merged bacterial coverage and default mask
-
-$rf_archaea_df_mask_A[0]  = undef;
-$rf_bacteria_df_mask_A[0] = undef;
-$rf_archaea_cov_df_merged_mask_A[0]  = undef;
-$rf_bacteria_cov_df_merged_mask_A[0] = undef;
-
-# input the default masks (we have the other masks we need already stored
-parse_mask_file($archaea_df_maskfile,  \@rf_archaea_df_mask_A,   $FH_HR);
-parse_mask_file($bacteria_df_maskfile, \@rf_bacteria_df_mask_A,  $FH_HR);
-
-# archaea
-for($rfpos_archaea = 1; $rfpos_archaea <= $rflen_archaea; $rfpos_archaea++) { 
-  $rfpos_bacteria = $rf_archaea_map_A[$rfpos_archaea];
-  if($rfpos_bacteria != -1) { 
-    $rf_archaea_cov_df_merged_mask_A[$rfpos_archaea] = ($rf_archaea_cov_mask_A[$rfpos_archaea] &&
-                                                        $rf_archaea_df_mask_A[$rfpos_archaea] && 
-                                                        $rf_bacteria_df_mask_A[$rfpos_bacteria]) ? 1 : 0;
+  $rf_archaea_df_mask_A[0]  = undef;
+  $rf_bacteria_df_mask_A[0] = undef;
+  $rf_archaea_cov_df_merged_mask_A[0]  = undef;
+  $rf_bacteria_cov_df_merged_mask_A[0] = undef;
+  
+  # input the default masks (we have the other masks we need already stored
+  parse_mask_file($archaea_df_maskfile,  \@rf_archaea_df_mask_A,  $FH_HR);
+  parse_mask_file($bacteria_df_maskfile, \@rf_bacteria_df_mask_A, $FH_HR);
+  
+  # archaea
+  for($rfpos_archaea = 1; $rfpos_archaea <= $rflen_archaea; $rfpos_archaea++) { 
+    $rfpos_bacteria = $rf_archaea_map_A[$rfpos_archaea];
+    if($rfpos_bacteria != -1) { 
+      $rf_archaea_cov_df_merged_mask_A[$rfpos_archaea] = ($rf_archaea_cov_mask_A[$rfpos_archaea] &&
+                                                          $rf_archaea_df_mask_A[$rfpos_archaea] && 
+                                                          $rf_bacteria_df_mask_A[$rfpos_bacteria]) ? 1 : 0;
+    }
+    else { 
+      $rf_archaea_cov_df_merged_mask_A[$rfpos_archaea] = 0;
+    }
   }
-  else { 
-    $rf_archaea_cov_df_merged_mask_A[$rfpos_archaea] = 0;
+  my $rf_archaea_cov_df_merged_mask_file = $dir . "/" . create_out_root($fafile_H{"archaea-bacteria"}, "archaea") . ".cov-and-df.mask";
+  my $rf_archaea_cov_df_merged_ninc = output_mask_file($rf_archaea_cov_df_merged_mask_file, \@rf_archaea_cov_df_merged_mask_A, $rflen_archaea, $FH_HR);
+  addClosedFileToOutputInfo(\%ofile_info_HH, "archaea_cov_df_merged_mask", $rf_archaea_cov_df_merged_mask_file, 1, sprintf("archaeal mask  (%d len, %d included) created by merging coverage (cthresh: %.2f) and default SSU-ALIGN 0.1 masks", 
+                                                                                                                           $rflen_archaea, $rf_archaea_cov_df_merged_ninc, $cov_thresh));
+  $cov_df_merged_mask_H{"archaea"} = $rf_archaea_cov_df_merged_mask_file;
+  
+  # bacteria
+  for($rfpos_bacteria = 1; $rfpos_bacteria <= $rflen_bacteria; $rfpos_bacteria++) { 
+    $rfpos_archaea = $rf_bacteria_map_A[$rfpos_bacteria];
+    if($rfpos_archaea != -1) { 
+      $rf_bacteria_cov_df_merged_mask_A[$rfpos_bacteria] = ($rf_bacteria_cov_mask_A[$rfpos_bacteria] &&
+                                                            $rf_bacteria_df_mask_A[$rfpos_bacteria] && 
+                                                            $rf_archaea_df_mask_A[$rfpos_archaea]) ? 1 : 0;
+    }
+    else { 
+      $rf_bacteria_cov_df_merged_mask_A[$rfpos_bacteria] = 0;
+    }
   }
-}
-my $rf_archaea_cov_df_merged_mask_file = $dir . "/" . create_out_root($fafile_H{"archaea-bacteria"}, "archaea") . ".cov-and-df.mask";
-my $rf_archaea_cov_df_merged_ninc = output_mask_file($rf_archaea_cov_df_merged_mask_file, \@rf_archaea_cov_df_merged_mask_A, $rflen_archaea, $FH_HR);
-addClosedFileToOutputInfo(\%ofile_info_HH, "archaea_cov_df_merged_mask", $rf_archaea_cov_df_merged_mask_file, 1, sprintf("archaeal mask  (%d len, %d included) created by merging coverage (cthresh: %.2f) and default SSU-ALIGN 0.1 masks", 
-                                                                                                           $rflen_archaea, $rf_archaea_cov_df_merged_ninc, $cov_thresh));
-
-
-# bacteria
-for($rfpos_bacteria = 1; $rfpos_bacteria <= $rflen_bacteria; $rfpos_bacteria++) { 
-  $rfpos_archaea = $rf_bacteria_map_A[$rfpos_bacteria];
-  if($rfpos_archaea != -1) { 
-    $rf_bacteria_cov_df_merged_mask_A[$rfpos_bacteria] = ($rf_bacteria_cov_mask_A[$rfpos_bacteria] &&
-                                                          $rf_bacteria_df_mask_A[$rfpos_bacteria] && 
-                                                          $rf_archaea_df_mask_A[$rfpos_archaea]) ? 1 : 0;
+  my $rf_bacteria_cov_df_merged_mask_file = $dir . "/" . create_out_root($fafile_H{"archaea-bacteria"}, "bacteria") . ".cov-and-df.mask";
+  my $rf_bacteria_cov_df_merged_ninc = output_mask_file($rf_bacteria_cov_df_merged_mask_file, \@rf_bacteria_cov_df_merged_mask_A, $rflen_bacteria, $FH_HR);
+  addClosedFileToOutputInfo(\%ofile_info_HH, "bacteria_cov_df_merged_mask", $rf_bacteria_cov_df_merged_mask_file, 1, sprintf("bacterial mask (%d len, %d included) created by merging coverage (cthresh: %.2f) and default SSU-ALIGN 0.1 masks", 
+                                                                                                                             $rflen_bacteria, $rf_bacteria_cov_df_merged_ninc, $cov_thresh));
+  $cov_df_merged_mask_H{"bacteria"} = $rf_bacteria_cov_df_merged_mask_file;
+  
+  # sanity check
+  if($rf_archaea_cov_df_merged_ninc != $rf_bacteria_cov_df_merged_ninc) { 
+    DNAORG_FAIL(sprintf("ERROR, number of positions included for archaea in merged mask cov and df mask %d, differs from number of positions included for bacteria: %d", $rf_archaea_cov_df_merged_ninc, $rf_bacteria_cov_df_merged_ninc), 1, $FH_HR);
   }
-  else { 
-    $rf_bacteria_cov_df_merged_mask_A[$rfpos_bacteria] = 0;
-  }
-}
-my $rf_bacteria_cov_df_merged_mask_file = $dir . "/" . create_out_root($fafile_H{"archaea-bacteria"}, "bacteria") . ".cov-and-df.mask";
-my $rf_bacteria_cov_df_merged_ninc = output_mask_file($rf_bacteria_cov_df_merged_mask_file, \@rf_bacteria_cov_df_merged_mask_A, $rflen_bacteria, $FH_HR);
-addClosedFileToOutputInfo(\%ofile_info_HH, "bacteria_cov_df_merged_mask", $rf_bacteria_cov_df_merged_mask_file, 1, sprintf("bacterial mask (%d len, %d included) created by merging coverage (cthresh: %.2f) and default SSU-ALIGN 0.1 masks", 
-                                                                                                             $rflen_bacteria, $rf_bacteria_cov_df_merged_ninc, $cov_thresh));
+  
+  outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
+} # end of if (! opt_Get("--pp", \%opt_HH)) 
 
-# sanity check
-if($rf_archaea_cov_df_merged_ninc != $rf_bacteria_cov_df_merged_ninc) { 
-  DNAORG_FAIL(sprintf("ERROR, number of positions included for archaea in merged mask cov and df mask %d, differs from number of positions included for bacteria: %d", $rf_archaea_cov_df_merged_ninc, $rf_bacteria_cov_df_merged_ninc), 1, $FH_HR);
-}
-
-outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
-
-##############################################################
-# Step 8. Create posterior-probability based masks (OPTIONAL)
-##############################################################
-my @rf_archaea_pp_joint_mask_A = ();  # [1..$rfpos_archaea $rflen_archaea]: '1' if position $rfpos_archaea
-                                      # is included by the posterior probability-based mask, else '0'
-my @rf_bacteria_pp_joint_mask_A = (); # [1..$rfpos_bacteria $rflen_bacteria]: '1' if position $rfpos_bacteria
-                                      # is included by the posterior probability-based based mask, else '0'
+################################################################################################################
+# Steps 9-11 are OPTIONAL, we only do them if --pp was used. These pertain to posterior-probability based masks
+################################################################################################################
 if(opt_Get("--pp", \%opt_HH)) { 
-  $start_secs = outputProgressPrior("Creating posterior probability-based masks", $progress_w, $log_FH, *STDOUT);
+  #############################################################################################################################
+  # Step 9. Run ssu-mask on each of the single domain sequence ssu-align created alignments (OPTIONAL, we do this if --pp used)
+  #############################################################################################################################
+  $start_secs = outputProgressPrior("Running ssu-mask on all of the ssu-align created alignments", $progress_w, $log_FH, *STDOUT);
+  my %pp_mask_file_HH = (); # 2D hash, 1st dim key: model, 2nd dim key: sequences aligned 
+  my $pf_option = "--pf " . opt_Get("--pfract", \%opt_HH);
+  my $pt_option = "--pt " . opt_Get("--pthresh", \%opt_HH);
+  my $pf_key    = "pf." . int(100 * opt_Get("--pfract", \%opt_HH));
+  my $pt_key    = "pt." . int(100 * opt_Get("--pthresh", \%opt_HH));
+  
+  foreach my $domain ("archaea", "bacteria") { 
+    foreach my $key (sort keys %fafile_H) { 
+      my $fafile = $fafile_H{$key};
+      my $out_root = create_out_root($fafile, $domain);
+      my $out_dir  = $dir . "/" . $out_root;
+      
+      if($key ne "archaea-bacteria") { 
+        # mask this alignment
+        my $ssu_mask_cmd  = $execs_H{"ssu-mask"} . " $pf_option $pt_option $out_dir > /dev/null";
+        my $ssu_mask_file = $out_dir . "/" . $out_root . ".$domain.mask";
+        $pp_mask_file_HH{$domain}{$key} = $ssu_mask_file;
+        runCommand($ssu_mask_cmd, opt_Get("-v", \%opt_HH), $FH_HR);
+        # addClosedFileToOutputInfo(\%ofile_info_HH, "ssu-mask.$domain.$key", $ssu_mask_file, 1, sprintf("ssu-mask mask file for %s-based alignment of %s sequences", $domain, $key));
+      }
+    }
+  }
+  outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
 
+  #######################################################################################
+  # Step 10. Create posterior-probability based masks (OPTIONAL, we do this if --pp used)
+  #######################################################################################
+  my @rf_archaea_pp_joint_mask_A = ();  # [1..$rfpos_archaea $rflen_archaea]: '1' if position $rfpos_archaea
+                                        # is included by the posterior probability-based mask, else '0'
+  my @rf_bacteria_pp_joint_mask_A = (); # [1..$rfpos_bacteria $rflen_bacteria]: '1' if position $rfpos_bacteria
+                                        # is included by the posterior probability-based based mask, else '0'
+  $start_secs = outputProgressPrior("Creating posterior probability-based masks", $progress_w, $log_FH, *STDOUT);
+  
   if($rf_archaea_nmap != $rf_bacteria_nmap) { 
     DNAORG_FAIL(sprintf("ERROR, number of mapped positions differs between archaeal and bacteria maps, this shouldn't happen; archaea: %d != bacteria: %d", $rf_archaea_nmap, $rf_bacteria_nmap), 1, $FH_HR);
   }
-
+  
   # create the posterior probability based mask for archaea, 
   # rfpos $rfpos is a '1' (included by the mask) iff:
   # - it maps to a position ($rfpos_bacteria) in bacteria
@@ -573,7 +590,7 @@ if(opt_Get("--pp", \%opt_HH)) {
       $rf_archaea_pp_joint_mask_A[$rfpos_archaea] = 0; # this position in archaea wasn't mappable to a position in bacteria
     }
   }
-
+  
   # get the pp-mask in bacterial coordinates
   for($rfpos_bacteria = 1; $rfpos_bacteria <= $rflen_bacteria; $rfpos_bacteria++) { 
     $rfpos_archaea = $rf_bacteria_map_A[$rfpos_bacteria];
@@ -585,31 +602,29 @@ if(opt_Get("--pp", \%opt_HH)) {
       $rf_bacteria_pp_joint_mask_A[$rfpos_bacteria] = 0; # this position in bacteria wasn't mappable to a position in archaea
     }
   }
-
+  
   # output the masks
   my $rf_archaea_pp_joint_mask_file = $dir . "/" . create_out_root($fafile_H{"archaea-bacteria"}, "archaea") . ".pp.mask";
-
+  
   my $rf_archaea_pp_joint_ninc = output_mask_file($rf_archaea_pp_joint_mask_file, \@rf_archaea_pp_joint_mask_A, $rflen_archaea, $FH_HR);
   addClosedFileToOutputInfo(\%ofile_info_HH, "archaea_pp_joint_mask", $rf_archaea_pp_joint_mask_file, 1, sprintf("archaeal mask  (%d len, %d included) based on posterior probabilities (pfract: %.2f, pthresh: %.2f) of cross-domain alignments", 
                                                                                                                  $rflen_archaea, $rf_archaea_pp_joint_ninc, opt_Get("--pfract", \%opt_HH), opt_Get("--pthresh", \%opt_HH)));
-
+  
   my $rf_bacteria_pp_joint_mask_file = $dir . "/" . create_out_root($fafile_H{"archaea-bacteria"}, "bacteria") . ".pp.mask";
   my $rf_bacteria_pp_joint_ninc = output_mask_file($rf_bacteria_pp_joint_mask_file, \@rf_bacteria_pp_joint_mask_A, $rflen_bacteria, $FH_HR);
   addClosedFileToOutputInfo(\%ofile_info_HH, "bacteria_pp_joint_mask", $rf_bacteria_pp_joint_mask_file, 1, sprintf("bacterial mask (%d len, %d included) based on posterior probabilities (pfract: %.2f, pthresh %.2f) of cross-domain alignments", 
                                                                                                                    $rflen_bacteria, $rf_bacteria_pp_joint_ninc, opt_Get("--pfract", \%opt_HH), opt_Get("--pthresh", \%opt_HH)));
-
+  
   # sanity check
   if($rf_archaea_pp_joint_ninc != $rf_bacteria_pp_joint_ninc) { 
     DNAORG_FAIL(sprintf("ERROR, number of positions included for archaea in coverage based mask %d, differs from number of positions included for bacteria: %d", $rf_archaea_pp_joint_ninc, $rf_bacteria_pp_joint_ninc), 1, $FH_HR);
   }
-
+  
   outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
-}
 
-##############################################################################################
-# Step 9. Merge coverage-based and posterior-probability based masks into new masks (OPTIONAL)
-##############################################################################################
-if(opt_Get("--pp", \%opt_HH)) { 
+  ###################################################################################################################
+  # Step 11. Merge coverage-based and posterior-probability based masks into new masks (OPTIONAL, we do this if --pp)
+  ###################################################################################################################
   $start_secs = outputProgressPrior("Merging coverage and posterior probability-based masks", $progress_w, $log_FH, *STDOUT);
 
   my @rf_archaea_cov_pp_merged_mask_A  = (); # merged mask of coverage and pp joint masks
@@ -617,8 +632,8 @@ if(opt_Get("--pp", \%opt_HH)) {
   $rf_archaea_cov_pp_merged_mask_A[0]  = undef;
   $rf_bacteria_cov_pp_merged_mask_A[0] = undef;
 
-# archaea
-# input the 2 archaeal masks
+  # archaea
+  # input the 2 archaeal masks
   for($rfpos_archaea = 1; $rfpos_archaea <= $rflen_archaea; $rfpos_archaea++) { 
     $rf_archaea_cov_pp_merged_mask_A[$rfpos_archaea] = ($rf_archaea_cov_mask_A[$rfpos_archaea] eq "1" && 
                                                         $rf_archaea_pp_joint_mask_A[$rfpos_archaea] eq "1") ? 1 : 0;
@@ -627,9 +642,10 @@ if(opt_Get("--pp", \%opt_HH)) {
   my $rf_archaea_cov_pp_merged_ninc = output_mask_file($rf_archaea_cov_pp_merged_mask_file, \@rf_archaea_cov_pp_merged_mask_A, $rflen_archaea, $FH_HR);
   addClosedFileToOutputInfo(\%ofile_info_HH, "archaea_cov_pp_merged_mask", $rf_archaea_cov_pp_merged_mask_file, 1, sprintf("archaeal mask  (%d len, %d included) created by merging coverage (cthresh: %.2f) and pp-based (pfract: %.2f, pthresh: %.2f) masks", 
                                                                                                                            $rflen_archaea, $rf_archaea_cov_pp_merged_ninc, $cov_thresh, opt_Get("--pfract", \%opt_HH),  opt_Get("--pthresh", \%opt_HH)));
+  $cov_pp_merged_mask_H{"archaea"} = $rf_archaea_cov_pp_merged_mask_file;
 
-# bacteria
-# input the 2 bacterial masks
+  # bacteria
+  # input the 2 bacterial masks
   for($rfpos_bacteria = 1; $rfpos_bacteria <= $rflen_bacteria; $rfpos_bacteria++) { 
     $rf_bacteria_cov_pp_merged_mask_A[$rfpos_bacteria] = ($rf_bacteria_cov_mask_A[$rfpos_bacteria] eq "1" && 
                                                           $rf_bacteria_pp_joint_mask_A[$rfpos_bacteria] eq "1") ? 1 : 0;
@@ -638,14 +654,68 @@ if(opt_Get("--pp", \%opt_HH)) {
   my $rf_bacteria_cov_pp_merged_ninc = output_mask_file($rf_bacteria_cov_pp_merged_mask_file, \@rf_bacteria_cov_pp_merged_mask_A, $rflen_bacteria, $FH_HR);
   addClosedFileToOutputInfo(\%ofile_info_HH, "bacteria_cov_pp_merged_mask", $rf_bacteria_cov_pp_merged_mask_file, 1, sprintf("bacterial mask (%d len, %d included) created by merging coverage (cthresh: %.2f) and pp-based (pfract: %.2f, pthresh: %.2f) masks", 
                                                                                                                              $rflen_bacteria, $rf_bacteria_cov_pp_merged_ninc, $cov_thresh, opt_Get("--pfract", \%opt_HH),  opt_Get("--pthresh", \%opt_HH)));
+  $cov_pp_merged_mask_H{"bacteria"} = $rf_bacteria_cov_pp_merged_mask_file;
 
-# sanity check
+  # sanity check
   if($rf_archaea_cov_pp_merged_ninc != $rf_bacteria_cov_pp_merged_ninc) { 
     DNAORG_FAIL(sprintf("ERROR, number of positions included for archaea in merged cov and pp mask %d, differs from number of positions included for bacteria: %d", $rf_archaea_cov_pp_merged_ninc, $rf_bacteria_cov_pp_merged_ninc), 1, $FH_HR);
   }
 
   outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
+} # end of 'if(opt_Get("--pp", \%opt_HH))'
+
+###########################################################################################################################
+# Step 12. Create SS diagrams of the merged masks (coverage merged with default, or coverage merged with pp (if --pp used)
+###########################################################################################################################
+$start_secs = outputProgressPrior("Creating secondary structure diagrams of the masks", $progress_w, $log_FH, *STDOUT);
+foreach my $domain ("archaea", "bacteria") { 
+  my $out_root = create_out_root($fafile_H{$domain}, $domain);
+  my $out_dir  = $dir . "/" . $out_root;
+  
+  # first, make a SS diagram of only the masks, with pink/black coloring, using ssu-mask
+  # on the alignments we created in step 2 (or earlier if --skipalign is used)
+  my $alignment_file  = $out_dir . "/" . $out_root . ".$domain.stk";
+  my $mask_file_to_draw = (opt_Get("--pp", \%opt_HH)) ? $cov_pp_merged_mask_H{$domain} : $cov_df_merged_mask_H{$domain};
+  my $ssu_mask_cmd  = $execs_H{"ssu-mask"} . " -s $mask_file_to_draw -a $alignment_file > /dev/null";
+  my $mask_ss_file  = $out_root . ".$domain.mask.pdf";
+  my $mask_aln_file = $out_root . ".$domain.mask.stk";
+  my $mask_sum_file = $out_root . ".$domain.ssu-mask.sum";
+  my $mask_log_file = $out_root . ".$domain.ssu-mask.log";
+  
+  runCommand($ssu_mask_cmd, opt_Get("-v", \%opt_HH), $FH_HR);
+  
+  # we only need the mask diagram, remove the other files
+  removeFileUsingSystemRm($mask_aln_file, undef, \%opt_HH, $FH_HR);
+  removeFileUsingSystemRm($mask_sum_file, undef, \%opt_HH, $FH_HR);
+  removeFileUsingSystemRm($mask_log_file, undef, \%opt_HH, $FH_HR);
+  
+  # move the secondary structure file into the directory we want it in
+  my $mv_cmd = "mv $mask_ss_file $dir";
+  runCommand($mv_cmd, opt_Get("-v", \%opt_HH), $FH_HR);
+  $mask_ss_file = $dir . "/" . $mask_ss_file;
+  addClosedFileToOutputInfo(\%ofile_info_HH, $domain . "-mask-ss-diagram", $mask_ss_file, 1, sprintf("structure diagram of merged coverage and %s mask for %s", opt_Get("--pp", \%opt_HH) ? "pp" : "default", $domain));
+  
+  # now project the mask onto the aligned sequences from the input fasta file
+  my $ssu_draw_cmd  = $execs_H{"ssu-draw"} . " -s $mask_file_to_draw -a $alignment_file > /dev/null";
+  my $draw_ss_file  = $out_root . ".$domain.pdf";
+  my $draw_tab_file = $out_root . ".$domain.drawtab";
+  my $draw_sum_file = $out_root . ".$domain.ssu-draw.sum";
+  my $draw_log_file = $out_root . ".$domain.ssu-draw.log";
+  
+  runCommand($ssu_draw_cmd, opt_Get("-v", \%opt_HH), $FH_HR);
+  
+  # we only need the mask diagram, remove the other files
+  removeFileUsingSystemRm($draw_tab_file, undef, \%opt_HH, $FH_HR);
+  removeFileUsingSystemRm($draw_sum_file, undef, \%opt_HH, $FH_HR);
+  removeFileUsingSystemRm($draw_log_file, undef, \%opt_HH, $FH_HR);
+  
+  # move the secondary structure file into the directory we want it in
+  $mv_cmd = "mv $draw_ss_file $dir";
+  runCommand($mv_cmd, opt_Get("-v", \%opt_HH), $FH_HR);
+  $draw_ss_file = $dir . "/" . $draw_ss_file;
+  addClosedFileToOutputInfo(\%ofile_info_HH, $domain . "--aln-ss-diagram", $draw_ss_file, 1, sprintf("structure diagram of merged coverage and %s mask overlaid on alignment %s", opt_Get("--pp", \%opt_HH) ? "pp" : "default", $out_root . ".$domain.stk"));
 }
+outputProgressComplete($start_secs, undef, $log_FH, *STDOUT);
 
 ##########
 # Conclude
